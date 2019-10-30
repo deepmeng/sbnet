@@ -43,9 +43,9 @@ def scatter_custom(q, indices, out_shape, bsize_out, boffset, bstride):
         indices.bin_counts,
         indices.active_block_indices,
         y,
-        bsize=bsize_out,
-        boffset=boffset,
-        bstride=bstride,
+        dynamic_bsize=tf.constant(bsize_out, tf.int32),
+        dynamic_bstride=tf.constant(bstride, tf.int32),
+        dynamic_boffset=tf.constant(boffset, tf.int32),
         add=False)
     return y
 
@@ -63,9 +63,9 @@ class SparseScatterTests(tf.test.TestCase):
                 x,
                 ind_custom.bin_counts,
                 ind_custom.active_block_indices,
-                bsize=block_params.bsize,
-                bstride=block_params.bstrides,
-                boffset=block_params.boffset)
+                dynamic_bsize=tf.constant(block_params.bsize, tf.int32),
+                dynamic_bstride=tf.constant(block_params.bstrides, tf.int32),
+                dynamic_boffset=tf.constant(block_params.boffset, tf.int32))
             p_shape = [
                 int(x.get_shape()[0]), block_params.bsize[0], block_params.bsize[1],
                 int(x.get_shape()[3])
@@ -82,12 +82,11 @@ class SparseScatterTests(tf.test.TestCase):
                 p, p_custom, q, y_tf, y_custom, ind_custom.active_block_indices,
                 ind_custom.bin_counts
             ])
-            num = num[0]
-            sortIdx = active[:num].argsort()
-            p2 = p2[sortIdx]
 
             # Make sure p's are the same.
-            np.testing.assert_array_equal(p1, p2)
+            l1 = tuple([tuple(x) for x in p1.reshape(-1, 3).tolist()])
+            l2 = tuple([tuple(x) for x in p2.reshape(-1, 3).tolist()])
+            np.testing.assert_array_equal(set(l1), set(l2))
 
             # Check y's are the same.
             np.testing.assert_array_equal(y1, y2)

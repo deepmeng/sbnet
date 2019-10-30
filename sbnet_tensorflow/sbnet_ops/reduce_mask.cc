@@ -60,7 +60,7 @@ template <typename T> struct ReduceMaskFunctor<CPUDevice, T> {
         int bCntW,                      // Number of blocks, width.
         unsigned int numBins,
         unsigned int binSize,
-        int64* activeBlockIndices,      // Indices of active blocks.
+        short* activeBlockIndices,        // Indices of active blocks.
         int* binCounts,                 // Number of active indices.
         bool avgPool
         )
@@ -86,8 +86,12 @@ template <typename T> struct ReduceMaskFunctor<CPUDevice, T> {
             } } }
             if (avgPool)
                 active = ( (sum/(bSzH*bSzW)) > threshold );
-            if (active)
-                activeBlockIndices[count++] = to64Bit((uint16)n, (uint16)bh, (uint16)bw);
+            if (active) {
+                activeBlockIndices[count*3+0] = n;
+                activeBlockIndices[count*3+1] = bh;
+                activeBlockIndices[count*3+2] = bw;
+                count++;
+            }
         } } }
         binCounts[0] = count;
     }
@@ -95,14 +99,14 @@ template <typename T> struct ReduceMaskFunctor<CPUDevice, T> {
 
 REGISTER_OP("ReduceMask")
     .Attr("T: {float}")
-    .Attr("bsize: list(int)")
-    .Attr("bstride: list(int)")
-    .Attr("boffset: list(int)")
     .Attr("tol: float")
     .Attr("avgpool: bool = false")
     .Input("mask: T")
     .Input("dynamic_bcount: int32")
-    .Output("active_block_indices: int64")
+    .Input("dynamic_bsize: int32")
+    .Input("dynamic_bstride: int32")
+    .Input("dynamic_boffset: int32")
+    .Output("active_block_indices: int16")
     .Output("bin_counts: int32");
 
 // template parameter <T> is the datatype of the tensors.
@@ -112,13 +116,7 @@ public:
         : OpKernel(context)
     {
         std::vector<int> bsize, bstride, boffset;
-        OP_REQUIRES_OK(context, context->GetAttr("bsize", &bsize));
-        OP_REQUIRES_OK(context, context->GetAttr("bstride", &bstride));
-        OP_REQUIRES_OK(context, context->GetAttr("boffset", &boffset));
         OP_REQUIRES_OK(context, context->GetAttr("avgpool", &avgpool_));
-        bSzH_    = bsize[0];   bSzW_ = bsize[1];
-        bStrH_   = bstride[0]; bStrW_ = bstride[1];
-        bOffsH0_ = boffset[0]; bOffsW0_ = boffset[1];
         OP_REQUIRES_OK(context, context->GetAttr("tol", &tol_));
     }
 
@@ -127,26 +125,43 @@ public:
         // Grabs the input mask.
         const Tensor& mask = context->input(0);
         const Tensor& bcount_dynamic = context->input(1);
-        int bNumDims = bcount_dynamic.dims();
-        int dim0 = bcount_dynamic.dim_size(0);
-        OP_REQUIRES(context, bNumDims == 1 && dim0 == 2,
-            errors::InvalidArgument("dynamic_bcount should be one-dimensional with shape[0] == 2."));
+        const Tensor& bsize_dynamic = context->input(2);
+        const Tensor& bstride_dynamic = context->input(3);
+        const Tensor& boffset_dynamic = context->input(4);
+
+        const Tensor* toCheck[] = {&bcount_dynamic, &bsize_dynamic, &bstride_dynamic, &boffset_dynamic};
+        for (auto tc: toCheck) {
+            int bNumDims = tc->dims();
+            int dim0 = tc->dim_size(0);
+            OP_REQUIRES(context, bNumDims == 1 && dim0 == 2,
+                errors::InvalidArgument("dynamic_b<count, size, stride, offset> should be one-dimensional with shape[0] == 2."));
+        }
 
         // Grabs input shape.
         int N = mask.dim_size(0);
         int H = mask.dim_size(1);
         int W = mask.dim_size(2);
 
-        bCntH_ = bcount_dynamic.flat<int32>().data()[0];
-        bCntW_ = bcount_dynamic.flat<int32>().data()[1];
+        int bCntH = bcount_dynamic.flat<int32>().data()[0];
+        int bCntW = bcount_dynamic.flat<int32>().data()[1];
+        int bSzH = bsize_dynamic.flat<int32>().data()[0];
+        int bSzW = bsize_dynamic.flat<int32>().data()[1];
+        int bStrH = bstride_dynamic.flat<int32>().data()[0];
+        int bStrW = bstride_dynamic.flat<int32>().data()[1];
+        int bOffsH0 = boffset_dynamic.flat<int32>().data()[0];
+        int bOffsW0 = boffset_dynamic.flat<int32>().data()[1];
+        //printf("cnt=%d, %d, sz=%d, %d, str=%d, %d, offs=%d, %d\n",
+        //       bCntH, bCntW, bSzH, bSzW, bStrH, bStrW, bOffsH0, bOffsW0);
+        //fflush(stdout);
 
         // Initializes output.
         // TODO: try to find a way not to redo the allocation in Compute
         Tensor* activeBlockIndices = NULL;
         TensorShape activeBlockShape;
-        int maxIndices = N * bCntH_ * bCntW_;
-        int activeBlockShapeArr[] = { maxIndices };
-        TensorShapeUtils::MakeShape(activeBlockShapeArr, 1, &activeBlockShape);
+        int maxIndices = N * bCntH * bCntW;
+        int activeBlockShapeArr[] = { maxIndices, 3 };
+        TensorShapeUtils::MakeShape(activeBlockShapeArr, 2, &activeBlockShape);
+        // output type is known from REGISTER_OP macro
         OP_REQUIRES_OK(context, context->allocate_output(0, activeBlockShape, &activeBlockIndices));
 
         unsigned int numBins = 1;
@@ -165,18 +180,18 @@ public:
             H,                                        // Height of the mask.
             W,                                        // Width of the mask.
             tol_,                                     // Threshold for being active.
-            bOffsH0_,                                 // Block padding offset height.
-            bOffsW0_,                                 // Block padding offset width.
-            bSzH_,                                    // Block size height.
-            bSzW_,                                    // Block size width.
-            bStrH_,                                   // Block stride, height.
-            bStrW_,                                   // Block stride, width.
-            bCntH_,                                   // Number of blocks, height.
-            bCntW_,                                   // Number of blocks, width.
+            bOffsH0,                                  // Block padding offset height.
+            bOffsW0,                                  // Block padding offset width.
+            bSzH,                                     // Block size height.
+            bSzW,                                     // Block size width.
+            bStrH,                                    // Block stride, height.
+            bStrW,                                    // Block stride, width.
+            bCntH,                                    // Number of blocks, height.
+            bCntW,                                    // Number of blocks, width.
             numBins,
             binSize,
-            activeBlockIndices->flat<int64>().data(), // Indices of active blocks.
-            binCounts.flat<int32>().data(),           // Indices of active blocks.
+            activeBlockIndices->flat<int16>().data(), // Indices of active blocks.
+            binCounts.flat<int32>().data(),           // Counts per bin of active blocks.
             avgpool_
             );
 
@@ -187,14 +202,18 @@ public:
         // read the resulting block count back from GPU to CPU mem
         if (std::is_same<Device, GPUDevice>::value) {
             cudaMemcpy(&readBack_, binCounts.flat<int32>().data(), sizeof(int32), cudaMemcpyDeviceToHost);
+            //cout << "Readback = " << readBack_ << endl; // scaffold
             if (readBack_ == 0) {
-                cudaMemset(activeBlockIndices->flat<int64>().data(), 0, sizeof(int64));
+                cudaMemset(activeBlockIndices->flat<int16>().data(), 0, sizeof(int16)*3);
                 readBack_ = 1;
             }
         } else {
             readBack_ = binCounts.flat<int32>().data()[0];
             if (readBack_ == 0) {
-                activeBlockIndices->flat<int64>().data()[0] = 0;
+                // TODO: what's the right thing to do if the mask is completely empty?
+                activeBlockIndices->flat<int16>().data()[0] = 0;
+                activeBlockIndices->flat<int16>().data()[1] = 0;
+                activeBlockIndices->flat<int16>().data()[2] = 0;
                 readBack_ = 1;
             }
         }
@@ -203,14 +222,6 @@ public:
 
 private:
     float tol_ = 0;                  // Active block threshold.
-    int bOffsH0_ = 0;                // Block padding offset height, negative.
-    int bOffsW0_ = 0;                // Block padding offset width, negative.
-    int bSzH_ = 0;                   // Block size height.
-    int bSzW_ = 0;                   // Block size width.
-    int bStrH_ = 0;                  // Block stride, height.
-    int bStrW_ = 0;                  // Block stride, width.
-    int bCntH_ = 0;                  // block count in H, zero-padded
-    int bCntW_ = 0;                  // block count in W, zero-padded
     bool avgpool_ = 0;
     int readBack_ = 0;
 };
@@ -227,6 +238,9 @@ REGISTER_CPU(float);
         Name("ReduceMask") \
         .Device(DEVICE_GPU) \
         .HostMemory("dynamic_bcount") \
+        .HostMemory("dynamic_bsize") \
+        .HostMemory("dynamic_bstride") \
+        .HostMemory("dynamic_boffset") \
         .HostMemory("bin_counts") \
         .TypeConstraint<T>("T"), \
         ReduceMaskOp<GPUDevice, T>);

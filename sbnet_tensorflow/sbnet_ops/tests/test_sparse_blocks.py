@@ -40,9 +40,9 @@ def _sparse_gather_grad(op, grad):
     x = op.inputs[0]
     binCounts = op.inputs[1]
     activeBlockIndices = op.inputs[2]
-    bsize = op.get_attr("bsize")
-    bstride = op.get_attr("bstride")
-    boffset = op.get_attr("boffset")
+    bsize = op.inputs[3]
+    bstride = op.inputs[4]
+    boffset = op.inputs[5]
     transpose = op.get_attr("transpose")
 
     # if scatter is overlapping then gradient should still work
@@ -53,14 +53,14 @@ def _sparse_gather_grad(op, grad):
         binCounts,
         activeBlockIndices,
         tf.zeros_like(x),    # output base tensor to add on top of
-        bsize=bsize,
-        bstride=bstride,
-        boffset=boffset,
+        dynamic_bsize=bsize,
+        dynamic_bstride=bstride,
+        dynamic_boffset=boffset,
         add=True,
         transpose=transpose,
         atomic=True)
 
-    return [result, None, None]    # no gradient wrt indices
+    return [result, None, None, None, None, None]    # no gradients wrt indices or block params
 
 
 @ops.RegisterGradient("SparseScatter")
@@ -71,13 +71,13 @@ def _sparse_scatter_grad(op, grad):
     binCounts = op.inputs[1]
     activeBlockIndices = op.inputs[2]
     ybase = op.inputs[3]
-    bsize = op.get_attr("bsize")
-    bstride = op.get_attr("bstride")
-    boffset = op.get_attr("boffset")
+    bsize = op.inputs[4]
+    bstride = op.inputs[5]
+    boffset = op.inputs[6]
     doAdd = op.get_attr("add")
 
     dout_dx = sbnet_module.sparse_gather(
-        grad, binCounts, activeBlockIndices, bsize=bsize, bstride=bstride, boffset=boffset)
+        grad, binCounts, activeBlockIndices, dynamic_bsize=bsize, dynamic_bstride=bstride, dynamic_boffset=boffset)
 
     # return a list of gradients of output with respect to each input
     if not doAdd:
@@ -87,15 +87,15 @@ def _sparse_scatter_grad(op, grad):
             binCounts,
             activeBlockIndices,
             tf.ones_like(grad),
-            bsize=bsize,
-            bstride=bstride,
-            boffset=boffset,
+            dynamic_bsize=bsize,
+            dynamic_bstride=bstride,
+            dynamic_boffset=boffset,
             add=False)
         dy_dybase = grad * stamp_out_blocks
-        return [dout_dx, None, None, dy_dybase]
+        return [dout_dx, None, None, dy_dybase, None, None, None]
     else:
         # d(x+ybase)/dybase = 1, so just pass back grad as dout_dybase
-        return [dout_dx, None, None, grad]
+        return [dout_dx, None, None, grad, None, None, None]
 
 
 def calcBlockCount1d(WW, SS, VV, BOFFSW):
@@ -133,7 +133,7 @@ def generateInputs(inputSize, RS, UV, BOFFS, N):
     return NN, HH, WW, CC, RR, SS, UU, VV, BCH, BCW, numBins, mask, x
 
 
-config = tf.ConfigProto(log_device_placement=False)
+config = tf.ConfigProto(log_device_placement=False, allow_soft_placement=False)
 config.graph_options.optimizer_options.opt_level = -1
 
 
@@ -161,6 +161,7 @@ class TestSparseConvolutions(unittest.TestCase):
         offset = 10.0
         for transpose in [False, True]:
             for devStr in ["/gpu:0", "/cpu:0"]:
+                isGpu = (devStr == "/gpu:0")
                 tf.reset_default_graph()
                 with tf.Session(config=config) as sess, tf.device(devStr):
                     if test_var:
@@ -172,43 +173,54 @@ class TestSparseConvolutions(unittest.TestCase):
                        tol = 1e32 # make sure at 100% sparsity we get zero blocks
                     a = tf.constant(mask, dtype=tf.float32)
                     print("-------------- BCNT=", BCH, BCW)
-                    b = sbnet_module.reduce_mask(
-                        a, tf.constant([BCH, BCW], dtype=tf.int32),
-                        bsize=[RR, SS],
-                        boffset=BOFFS,
-                        bstride=[UU, VV],
-                        tol=tol,
-                        avgpool=avgpool)
+                    print("-------------- BSZ=", RR, SS)
+                    print("-------------- BSTR=", UU, VV)
+                    print("-------------- BOFFS=", BOFFS[0], BOFFS[1])
+                    if 1:
+                        b = sbnet_module.reduce_mask(
+                            mask=a,
+                            dynamic_bcount=tf.constant([BCH, BCW], dtype=tf.int32),
+                            dynamic_bsize=tf.constant([int(RR), int(SS)], dtype=tf.int32),
+                            dynamic_bstride=tf.constant([int(UU), int(VV)], dtype=tf.int32),
+                            dynamic_boffset=tf.constant([int(BOFFS[0]), int(BOFFS[1])], dtype=tf.int32),
+                            tol=tol,
+                            avgpool=avgpool)
 
-                    # decouple indeterminstic portion into a separate subgraph for grad checker consistency
-                    py_bin_counts, py_active_block_indices = sess.run(
-                        [b.bin_counts, b.active_block_indices])
+                        # decouple indeterminstic portion into a separate subgraph for grad checker consistency
+                        py_bin_counts, py_active_block_indices = sess.run(
+                            [b.bin_counts, b.active_block_indices])
+                        #print ">>>>>>>>>>>>>>>>>>>> devStr=", devStr
+                        #print "PY_BINC=", py_bin_counts
+                        #print "PY_ABI=", py_active_block_indices
+                        #print "++++ i=", i
 
                     tf_bin_counts = tf.constant(py_bin_counts)
                     tf_active_block_indices = tf.constant(py_active_block_indices)
                     #bin_counts = tfx_print(b.bin_counts, "bin_counts")
 
                     tf_x = tf.convert_to_tensor(x, tf.float32)
-                    dt0 = sbnet_module.cuda_op_timer(timer_name="my_timer", is_start=True)
-                    with tf.control_dependencies([dt0]):
-                        tf_x = tf.identity(tf_x)
+                    if isGpu:
+                        with tf.control_dependencies([tf_x]):
+                            dt0 = sbnet_module.cuda_timer_start()
+                        with tf.control_dependencies([dt0]):
+                            tf_x = tf.identity(tf_x)
                     blockStack = sbnet_module.sparse_gather(
                         tf_x,
                         tf_bin_counts,
                         tf_active_block_indices,
-                        bsize=[RR, SS],
-                        boffset=BOFFS,
-                        bstride=[UU, VV],
+                        dynamic_bsize=tf.constant([RR, SS], dtype=tf.int32),
+                        dynamic_bstride=tf.constant([UU, VV], dtype=tf.int32),
+                        dynamic_boffset=tf.constant([BOFFS[0], BOFFS[1]], dtype=tf.int32),
                         transpose=transpose)
                     if test_var:
                         y1000 = sbnet_module.sparse_scatter_var(
                             blockStack,
                             tf_bin_counts,
                             tf_active_block_indices,
-                            x1000,    # base variable to copy to output and overwrite on top of
-                            bsize=[RR, SS],
-                            boffset=BOFFS,
-                            bstride=[UU, VV],
+                            x1000, # base variable to copy to output and overwrite on top of
+                            dynamic_bsize=tf.constant([RR, SS], dtype=tf.int32),
+                            dynamic_bstride=tf.constant([UU, VV], dtype=tf.int32),
+                            dynamic_boffset=tf.constant([BOFFS[0], BOFFS[1]], dtype=tf.int32),
                             add=do_add,
                             atomic=use_atomics,
                             transpose=transpose)
@@ -219,27 +231,32 @@ class TestSparseConvolutions(unittest.TestCase):
                             tf_bin_counts,
                             tf_active_block_indices,
                             x1000,    # base tensor to copy to output and overwrite on top of
-                            bsize=[RR, SS],
-                            boffset=BOFFS,
-                            bstride=[UU, VV],
+                            dynamic_bsize=tf.constant([RR, SS], dtype=tf.int32),
+                            dynamic_bstride=tf.constant([UU, VV], dtype=tf.int32),
+                            dynamic_boffset=tf.constant([BOFFS[0], BOFFS[1]], dtype=tf.int32),
                             add=do_add,
                             atomic=use_atomics,
                             transpose=transpose)
-                    dt = sbnet_module.cuda_op_timer(timer_name="my_timer", is_start=False)
-                    with tf.control_dependencies([dt]):
-                        y1000 = tf.identity(y1000)
+                    if isGpu:
+                        with tf.control_dependencies([y1000]):
+                            dt = sbnet_module.cuda_timer_end(dt0)
+                        with tf.control_dependencies([dt]):
+                            y1000 = tf.identity(y1000)
 
-                    result = sess.run([b, blockStack, y1000, dt])
-                    if result[3] != -1.0:
+                    if isGpu:
+                        result = sess.run([b, blockStack, y1000, dt])
                         print("CUDA time=", result[3])
-                    #print("BLOCKS=", result[1])
-                    #print("BLKIDS=", result[0])
+                    else:
+                        dt = tf.constant(-1.0, dtype=tf.float32)
+                        result = sess.run([b, blockStack, y1000, dt])
 
                     result[0] = lambda: 0
                     result[0].bin_counts = py_bin_counts
                     result[0].active_block_indices = py_active_block_indices
                     result.append(x)
                     result.append(mask)
+                    #print("BLOCKS=", result[1])
+                    #print("BLKIDS=", result[0])
 
                     tidx = 1 if transpose else 0
                     results[tidx].append(result)
@@ -285,11 +302,14 @@ class TestSparseConvolutions(unittest.TestCase):
                     )    # make sure the count of indices matches
             if sparsity == 100:
                 self.assertTrue(
-                    reducedCpu.bin_counts[0] == 1 and reducedCpu.active_block_indices[0] == 0)
+                    reducedCpu.bin_counts[0] == 1 and
+                    np.array_equal(reducedCpu.active_block_indices[0], np.array([0, 0, 0])))
             bin_count = reducedCpu.bin_counts[0]
-            set0 = set([x for x in cpuIndices])
-            set1 = set([x for x in gpuIndices])
-            sorted = reducedGpu.active_block_indices[0:bin_count].argsort()
+            set0 = set([tuple(x) for x in cpuIndices.tolist()])
+            set1 = set([tuple(x) for x in gpuIndices.tolist()])
+            toSort = reducedGpu.active_block_indices[0:bin_count].tolist()
+            toSort = np.array([(x[0]*BCH*BCW + x[1]*BCW + x[2]) for x in toSort])
+            sorted = toSort.argsort()
             self.assertTrue(set0 == set1)    # make sure the sets of indices match
             self.assertTrue(np.array_equal(cpuIndices, gpuIndices[sorted]))    # make sure sorted indices match
 
@@ -304,6 +324,10 @@ class TestSparseConvolutions(unittest.TestCase):
                 # transposed is NCHW, convert to NHWC via [0, 2, 3, 1]
                 self.assertTrue(np.array_equal(gatheredCpuUT, np.transpose(gatheredCpuT, [0, 2, 3, 1])))
                 self.assertTrue(np.array_equal(gatheredCpuUT, np.transpose(gatheredGpuT, [0, 2, 3, 1])))
+
+            #print("GCPU=", gatheredCpu)
+            #print("GGPU=", gatheredGpu)
+
             gatherEq = np.array_equal(gatheredCpu, gatheredGpu)
             self.assertTrue(gatherEq)
 

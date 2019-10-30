@@ -185,28 +185,27 @@ class SparseResBlockGradientTests(tf.test.TestCase):
                                         bsize,
                                         strides,
                                         padding,
-                                        data_format='NHWC'):
+                                        data_format='NHWC',
+                                        dynamic_size=False):
         with tf.Graph().as_default() as g:
             x = tf.constant(xval)
             mask = tf.constant(maskval)
             ch_in = xval.shape[3]
             ch_out = xval.shape[3] // 4
             ksize_list = [[1, 1, ch_in, ch_out], [3, 3, ch_out, ch_out], [1, 1, ch_out, ch_in]]
-            blk_params = calc_block_params_res_block(xval.shape, bsize, ksize_list, strides,
-                                                     padding)
+            if dynamic_size:
+                blk_params = calc_block_params_res_block(
+                    tf.shape(xval), bsize, ksize_list, strides, padding)
+            else:
+                blk_params = calc_block_params_res_block(
+                    xval.shape, bsize, ksize_list, strides, padding)
             ind = convert_mask_to_indices_custom(mask, blk_params, 0.)
             ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
-            ind.active_block_indices.set_shape([27])
+            ind.active_block_indices.set_shape([27, 3])
             ind.bin_counts.set_shape([1])
             ind_var = tf.Variable(ind.active_block_indices, trainable=False)
             bin_var = tf.Variable(ind.bin_counts, trainable=False)
             ind_fixed = ReduceMask(active_block_indices=ind_var, bin_counts=bin_var)
-            tf_ind = convert_mask_to_indices_custom(mask, blk_params, 0.)
-            with self.test_session() as sess:
-                py_inds = sess.run([tf_ind])
-            ind = lambda: 0
-            ind.bin_counts = tf.constant(py_inds[0].bin_counts)
-            ind.active_block_indices = tf.constant(py_inds[0].active_block_indices)
 
             y = sparse_res_block_bottleneck(
                 x,
@@ -224,7 +223,7 @@ class SparseResBlockGradientTests(tf.test.TestCase):
             print('-' * 55)
             print('Sparse Residual')
             print('{:30s} {:>10s} {:>10s}'.format('name', 'grad angle', 'abs err'))
-            with self.test_session() as sess:
+            with tf.Session() as sess:
                 sess.run(tf.global_variables_initializer())
                 yval = y.eval()
                 err = compute_gradient_angle(x, xval.shape, y, yval.shape, x_init_value=xval)
@@ -263,8 +262,9 @@ class SparseResBlockGradientTests(tf.test.TestCase):
         mask = (mask > 0.5).astype(np.float32)
         xval = rnd.uniform(-0.1, 0.1, [mask.shape[0], mask.shape[1], mask.shape[2], ksize[2]
                                        ]).astype(np.float32) + 1.0
-        self._test_sparse_resblock_gradients(
-            xval, mask, bsize, strides, padding, data_format='NHWC')
+        for dynamic_size in [True, False]:
+            self._test_sparse_resblock_gradients(
+                xval, mask, bsize, strides, padding, data_format='NHWC', dynamic_size=dynamic_size)
 
 
 class SparseConv2DGradientTests(tf.test.TestCase):
@@ -277,7 +277,7 @@ class SparseConv2DGradientTests(tf.test.TestCase):
             list(mask.shape) + [ksize[2]], bsize, ksize, strides, padding)
         ind = convert_mask_to_indices_custom(mask_, blk_params, 0.)
         ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
-        ind.active_block_indices.set_shape([27])
+        ind.active_block_indices.set_shape([27, 3])
         ind.bin_counts.set_shape([1])
         ind_var = tf.Variable(ind.active_block_indices, trainable=False)
         bin_var = tf.Variable(ind.bin_counts, trainable=False)
